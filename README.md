@@ -1,0 +1,2 @@
+# Predicting-authorship-with-text2vec
+In this exercise, I will apply the text2vec package on the r package ```gutenbergr```giving us access to the works from the Project Gutenberg collection. By selecting two books - Pride and Prejudice from Jane Austen and a Tale of Two Cities from Charles Dickens - of similar length and publication date but of different authorship we prepare our data to fit a logistical regression that will aim to predict text belonging to which author. 
