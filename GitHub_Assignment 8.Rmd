@@ -1,0 +1,273 @@
+---
+title: "Predicting authorship with text2vec"
+author: "Celine Van den Rul"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Predicting authorship of "Pride and Prejudice" and "A Tale of Two Cities" using the text2vec package
+
+In this exercise, I will apply the text2vec package on the r package ```gutenbergr```giving us access to the works from the Project Gutenberg collection. By selecting two books - Pride and Prejudice from Jane Austen and a Tale of Two Cities from Charles Dickens - of similar length and publication date but of different authorship we prepare our data to fit a logistical regression that will aim to predict text belonging to which author.  
+
+```{r, echo=FALSE}
+library(gutenbergr)
+library(dplyr)
+library(text2vec)
+library(quanteda)
+library(glmnet)
+```
+
+## Preparing the data
+
+In the following lines of code, I prepare the corpus by downloading the two books of interest from the Project Gutenberg. I also create an additional column called document that is equal to the row number in order to have an ID for our rows of text. I also set up a training and test set after carefully randomizing our rows.  
+
+```{r, message=FALSE}
+# Downloading the works from Project Gutenberg
+Austen <- gutenberg_download(1342)
+Dickens <- gutenberg_download(98)
+books <- gutenberg_download(c(1342, 98), meta_fields = "title") %>% mutate(document=row_number())
+books %>% count(title)
+```
+
+```{r}
+# Removing NAs and blank rows from the dataset
+books <- books[!(is.na(books$text) | books$text==""), ]
+
+# Setting up a train and test set after randomization
+books <- books[sample(row.names (books)), ]
+books_train <- books[1:18447, ]
+books_test <- books[18448:23060, ]
+```
+
+## Vectorization
+
+In the following, I use the text2vec package to represent the document in vector space and create a vocabulary.  
+```{r, warning=FALSE}
+# Defining preprocessing function and tokenization function
+prep_fun = tolower
+tok_fun = word_tokenizer
+
+it_train = itoken(books_train$text, 
+             preprocessor = prep_fun, 
+             tokenizer = tok_fun, 
+             ids = books_train$document, 
+             progressbar = FALSE)
+vocab = create_vocabulary(it_train)
+
+# A look at our vocabulary
+vocab
+```
+
+Now that I have a vocabulary, I can construct the document-term matrix. 
+
+```{r}
+vectorizer = vocab_vectorizer(vocab)
+t1 = Sys.time()
+dtm_train = create_dtm(it_train, vectorizer)
+
+# Checking the dimensions of the dfm
+dim(dtm_train)
+```
+
+## Logistical regression
+
+I then fit a first model using the glmnet package with an L1 penalty and 4 fold cross-validation.
+
+```{r}
+NFOLDS = 4
+t1 = Sys.time()
+glmnet_classifier = cv.glmnet(x = dtm_train, y = books_train[['gutenberg_id']], 
+                              family = 'binomial',
+                              alpha = 1,
+                              type.measure = "auc",
+                              nfolds = NFOLDS,
+                              thresh = 1e-3,
+                              maxit = 1e3)
+plot(glmnet_classifier)
+```
+
+```{r}
+print(paste("max AUC =", round(max(glmnet_classifier$cvm), 4)))
+```
+
+With a max AUC of 0.9357 we can be confident that I have successfully fited a logistical regression to my dtm. Now I can check the model's performance on the test data. I perform the similar steps as on my train data, including preprocessing and the creation of a dtm.
+
+```{r}
+
+# Re-running same preprocessing and tokenization functions on the test data
+it_test = books_test$text %>% 
+  prep_fun %>% 
+  tok_fun %>% 
+  itoken(ids = books_test$document, 
+         progressbar = FALSE)
+
+# Creating a dtm
+dtm_test = create_dtm(it_test, vectorizer)
+
+preds = predict(glmnet_classifier, dtm_test, type = 'response')[,1]
+
+glmnet:::auc(books_test$gutenberg_id, prob = preds)
+```
+
+### Feature hashing
+
+I then try to improve my model using feature hashing. 
+
+```{r}
+h_vectorizer = hash_vectorizer(hash_size = 2 ^ 14, ngram = c(1L, 2L))
+
+t1 = Sys.time()
+dtm_train = create_dtm(it_train, h_vectorizer)
+
+t1 = Sys.time()
+glmnet_classifier = cv.glmnet(x = dtm_train, y = books_train[['gutenberg_id']], 
+                             family = 'binomial', 
+                             alpha = 1,
+                             type.measure = "auc",
+                             nfolds = 5,
+                             thresh = 1e-3,
+                             maxit = 1e3)
+plot(glmnet_classifier)
+```
+
+```{r}
+print(paste("max AUC =", round(max(glmnet_classifier$cvm), 4)))
+```
+
+I can see that the AUC result is a bit worse than in my previous model. I continue by checking the model's performance on my test set.
+
+```{r}
+dtm_test = create_dtm(it_test, h_vectorizer)
+
+preds = predict(glmnet_classifier, dtm_test , type = 'response')[, 1]
+glmnet:::auc(books_test$gutenberg_id, preds)
+```
+
+### Model transformation: tf-idf
+
+I apply another popular technique which is TF-IDF transformation. It will not only normalize my dtm but also increase the weight of terms which are specific to a single document or handful of documents and decrease the weight for terms used in most document. 
+
+```{r}
+vocab = create_vocabulary(it_train)
+vectorizer = vocab_vectorizer(vocab)
+dtm_train = create_dtm(it_train, vectorizer)
+
+# define tfidf model
+tfidf = TfIdf$new()
+
+# fit model to train data and transform train data with fitted model
+dtm_train_tfidf = fit_transform(dtm_train, tfidf)
+
+
+# apply pre-trained tf-idf transformation to test data
+dtm_test_tfidf  = create_dtm(it_test, vectorizer) %>% 
+  transform(tfidf)
+```
+
+Once I have a tf-idf reweighted dtm, I fit a logistical regression:
+
+```{r}
+t1 = Sys.time()
+glmnet_classifier = cv.glmnet(x = dtm_train_tfidf, y = books_train[['gutenberg_id']], 
+                              family = 'binomial', 
+                              alpha = 1,
+                              type.measure = "auc",
+                              nfolds = NFOLDS,
+                              thresh = 1e-3,
+                              maxit = 1e3)
+
+plot(glmnet_classifier)
+```
+
+```{r}
+print(paste("max AUC =", round(max(glmnet_classifier$cvm), 4)))
+```
+Using the tf-idf transformation slightly decreases the AUC compared to my initial model without any transformation or feature hashing. 
+
+I then check its performance on my test set:
+
+```{r}
+preds = predict(glmnet_classifier, dtm_test_tfidf, type = 'response')[,1]
+glmnet:::auc(books_test$gutenberg_id, preds)
+```
+
+## Colloquations
+
+Here I will use the commands from the text2vec package for collocations. I here only rely on the Jane Austen book "Pride and Prejudice". 
+
+```{r, results="hide"}
+# Fitting the model
+Austen <- Austen[!(is.na(Austen$text) | Austen$text==""), ]
+
+model = Collocations$new(collocation_count_min = 50)
+txt = Austen$text
+it = itoken(txt)
+model$fit(it, n_iter = 3)
+```
+
+Here I show what I have:
+```{r}
+model$collocation_stat
+```
+
+Because some of the results are not ideal (e.g. I am) I decide to provide a vocabulary without stopwords to the model constructor. 
+
+```{r, results="hide"}
+it = itoken(txt)
+v = create_vocabulary(it, stopwords = stopwords::stopwords("en"))
+v = prune_vocabulary(v, term_count_min = 50)
+model2 = Collocations$new(vocabulary = v, collocation_count_min = 50, pmi_min = 0)
+model2$partial_fit(it)
+```
+
+This gives me the following results:
+```{r}
+model2$collocation_stat
+```
+
+I now filter them by applying some thresholds. 
+
+```{r}
+temp = model2$collocation_stat[pmi >= 4 & gensim >= 7 & lfmd >= -25, ]
+temp
+```
+
+I then prune learned collocations:
+
+```{r}
+model2$prune(pmi_min = 4, gensim_min = 7, lfmd_min = -25)
+identical(temp, model2$collocation_stat)
+```
+
+And continue training
+
+```{r, results="hide"}
+model2$partial_fit(it)
+model2$prune(pmi_min = 4, gensim_min = 7, lfmd_min = -25)
+```
+
+```{r}
+model2$collocation_stat
+```
+
+### Usage: Topic models with collocations
+
+Here, I incorporate collocations into topic models after creating a dtm and passing it to an LDA model
+
+```{r}
+Austen <- Austen %>% mutate(document=row_number())
+
+it = itoken(Austen$text, preprocessor = prep_fun, tokenizer = word_tokenizer, 
+            ids = Austen$document, progressbar = FALSE)
+it = model2$transform(it)
+v = create_vocabulary(it, stopwords = stop_words)
+v = prune_vocabulary(v, term_count_min = 10, doc_proportion_min = 0.01)
+
+N_TOPICS = 20
+vectorizer = vocab_vectorizer(v)
+dtm = create_dtm(it, vectorizer)
+lda = LDA$new(N_TOPICS)
+doc_topic = lda$fit_transform(dtm)
+```
+
